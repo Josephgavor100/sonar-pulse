@@ -1,0 +1,14 @@
+# --- Web framework ---
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9   # file uploads
+
+# --- Audio / ML ---
+torch>=2.4.0
+torchaudio>=2.4.0
+transformers>=4.44.0
+onnxruntime>=1.19.0
+librosa>=0.10.2
+
+# --- Vector DB ---
+qdrant-client>=1.11.0
