@@ -1,16 +1,27 @@
-# Python
+# Python Caches & Environments
 __pycache__/
 *.py[cod]
 *.so
 venv/
+.venv/
 .env
+
+# Testing & Tools
+.pytest_cache/
 
 # Node / Next.js
 node_modules/
 .next/
 out/
 
-# Audio / Data
+# Audio / Local Data
 *.mp3
 *.wav
 *.flac
+data/music/*
+data/queries/*
+!data/music/.gitkeep
+!data/queries/.gitkeep
+# Ignore local Qdrant database directory
+qdrant_db/
+

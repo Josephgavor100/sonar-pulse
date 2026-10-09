@@ -8,6 +8,7 @@ torch>=2.4.0
 torchaudio>=2.4.0         # used for resampling only
 soundfile>=0.12.1         # primary decoder
 librosa>=0.10.2           # fallback decoder (M4A/AAC via FFmpeg)
+mutagen>=1.47.0           # reads ID3/Vorbis/MP4 tags (CLI)
 transformers>=4.44.0
 onnxruntime>=1.19.0
 
