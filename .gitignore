@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+venv/
+.env
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+
+# Audio / Data
+*.mp3
+*.wav
+*.flac
