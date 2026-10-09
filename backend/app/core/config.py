@@ -23,6 +23,9 @@ class Settings:
     qdrant_collection: str = "sonar_pulse_audio"
     embedding_dim: int = 768  # AST pooled output size
 
+    # API
+    max_upload_mb: int = 50
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -34,4 +37,5 @@ def get_settings() -> Settings:
         qdrant_api_key=os.getenv("QDRANT_API_KEY") or None,
         qdrant_collection=os.getenv("QDRANT_COLLECTION", "sonar_pulse_audio"),
         embedding_dim=int(os.getenv("EMBEDDING_DIM", "768")),
+        max_upload_mb=int(os.getenv("MAX_UPLOAD_MB", "50")),
     )

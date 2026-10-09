@@ -57,19 +57,24 @@ class AudioEmbedder:
         self.dim: int = self.model.config.hidden_size
 
     @torch.inference_mode()
-    def embed(self, waveform: torch.Tensor) -> torch.Tensor:
-        """Embed a waveform into one vector per window.
+    def embed_windows(
+        self, waveform: torch.Tensor, hop_seconds: float | None = None
+    ) -> tuple[torch.Tensor, list[int]]:
+        """Embed a waveform into one vector per sliding window.
 
         Args:
             waveform: float32 tensor of shape ``(num_samples,)`` at 16 kHz.
+            hop_seconds: Override the default hop for this call.
 
         Returns:
-            Tensor of shape ``(num_windows, dim)``, rows L2-normalized, on CPU.
+            ``(embeddings, starts)``: embeddings of shape ``(num_windows, dim)``
+            (rows L2-normalized, on CPU) and each window's start in samples.
         """
         if waveform.ndim != 1 or waveform.numel() == 0:
             raise ValueError("Expected a non-empty 1-D waveform tensor.")
 
-        starts = window_starts(waveform.numel(), self.window, self.hop)
+        hop = self.hop if hop_seconds is None else max(1, int(hop_seconds * TARGET_SAMPLE_RATE))
+        starts = window_starts(waveform.numel(), self.window, hop)
         chunks = [waveform[s : s + self.window].cpu().numpy() for s in starts]
 
         outputs = []
@@ -82,7 +87,11 @@ class AudioEmbedder:
             outputs.append(pooled.cpu())
 
         embeddings = torch.cat(outputs, dim=0)
-        return torch.nn.functional.normalize(embeddings, p=2, dim=1)
+        return torch.nn.functional.normalize(embeddings, p=2, dim=1), starts
+
+    def embed(self, waveform: torch.Tensor) -> torch.Tensor:
+        """Embeddings only, shape ``(num_windows, dim)``, using the default hop."""
+        return self.embed_windows(waveform)[0]
 
     def embed_mean(self, waveform: torch.Tensor) -> torch.Tensor:
         """Single re-normalized vector of shape ``(dim,)`` for the whole clip."""
