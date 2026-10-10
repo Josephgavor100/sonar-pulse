@@ -1,0 +1,41 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+  body {
+    background:
+      radial-gradient(60rem 40rem at 50% -10%, rgba(79, 172, 254, 0.18), transparent 60%),
+      radial-gradient(40rem 30rem at 100% 35%, rgba(0, 242, 254, 0.08), transparent 60%),
+      #0b0f17;
+    background-attachment: fixed;
+  }
+  :focus-visible {
+    outline: 2px solid #00f2fe;
+    outline-offset: 2px;
+  }
+  input[type="range"] {
+    accent-color: #00f2fe;
+  }
+}
+
+@layer components {
+  .glass {
+    @apply bg-slate-900/60 backdrop-blur-xl border border-white/10 shadow-2xl;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-full px-5 py-2.5 font-medium transition active:scale-95 disabled:pointer-events-none disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-gradient-to-r from-pulse-cyan to-pulse-blue text-slate-950 hover:shadow-[0_0_24px_rgba(0,242,254,0.45)];
+  }
+  .btn-ghost {
+    @apply btn border border-white/15 text-white hover:bg-white/10;
+  }
+  .input {
+    @apply w-full rounded-xl border border-white/10 bg-slate-950/60 px-3 py-2 text-sm placeholder:text-slate-500;
+  }
+}
