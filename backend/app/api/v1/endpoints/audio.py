@@ -199,14 +199,19 @@ async def stream_audio(websocket: WebSocket, matcher: AudioMatcher = Depends(get
 
 @router.post("/recognize", response_model=RecognizeResponse)
 async def recognize(
-    file: UploadFile = File(..., description="Audio sample to identify"),
+    file: UploadFile = File(..., description="Audio sample or rolling live-listening window to identify"),
     max_ai_generated_score: float | None = Form(None, ge=0.0, le=1.0),
     vibe_tags: str | None = Form(None, description='JSON list or comma-separated tags'),
     limit: int = Form(5, ge=1, le=50),
     score_threshold: float = Form(0.5, ge=-1.0, le=1.0),
     matcher: AudioMatcher = Depends(get_matcher),
 ) -> RecognizeResponse:
-    """Identify an audio sample against the indexed tracks."""
+    """Identify an audio sample or a rolling live-listening window.
+
+    Live listeners post overlapping WAV windows repeatedly; regular uploaded
+    audio files continue to use the identical recognition path. Each request
+    is independently size-limited and applies the supplied match filters.
+    """
     data = await read_upload(file)
     try:
         result = await matcher.recognize_audio(
