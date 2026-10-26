@@ -113,16 +113,53 @@ async def test_recognize_success_schema(api, song_a, song_b):
     assert 0.9 < match["confidence"] <= 1.0001
 
 
+async def test_recognize_repeated_short_windows(api, song_a):
+    await ingest(api, song_a, "song_a")
+
+    # Live recognition posts overlapping short WAV windows repeatedly. Each
+    # request should be independently decodable and identify the indexed song.
+    for start in (4, 6, 8):
+        response = await api.post(
+            "/api/v1/recognize",
+            files=upload(wav_bytes(crop(song_a, start, start + 10))),
+            data={"limit": "5", "score_threshold": "0.5"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["query_windows"] == 1
+        assert body["query_duration_seconds"] == pytest.approx(10.0, abs=0.01)
+        assert [match["track_id"] for match in body["matches"]] == ["song_a"]
+        assert body["matches"][0]["offset_seconds"] == pytest.approx(start, abs=0.01)
+
+
 async def test_recognize_filters(api, song_a):
     await ingest(api, song_a, "human", vibe_tags='["chill"]', ai_generated_score="0.05")
     await ingest(api, song_a, "synthetic", vibe_tags='["energetic"]', ai_generated_score="0.95")
-    clip = upload(wav_bytes(crop(song_a, 0, 10)))
 
-    r = await api.post("/api/v1/recognize", files=clip, data={"max_ai_generated_score": "0.5"})
-    assert [m["track_id"] for m in r.json()["matches"]] == ["human"]
+    # Each live-style short-window request must apply the supplied filters,
+    # rather than leaking matches from a previous recognition request.
+    for start in (0, 2, 4):
+        clip = upload(wav_bytes(crop(song_a, start, start + 10)))
 
-    r = await api.post("/api/v1/recognize", files=clip, data={"vibe_tags": "energetic"})
-    assert [m["track_id"] for m in r.json()["matches"]] == ["synthetic"]
+        response = await api.post(
+            "/api/v1/recognize", files=clip, data={"max_ai_generated_score": "0.5"}
+        )
+        assert response.status_code == 200
+        assert [match["track_id"] for match in response.json()["matches"]] == ["human"]
+
+        response = await api.post(
+            "/api/v1/recognize", files=clip, data={"vibe_tags": "energetic"}
+        )
+        assert response.status_code == 200
+        assert [match["track_id"] for match in response.json()["matches"]] == ["synthetic"]
+
+        response = await api.post(
+            "/api/v1/recognize",
+            files=clip,
+            data={"max_ai_generated_score": "0.5", "vibe_tags": "energetic"},
+        )
+        assert response.status_code == 200
+        assert response.json()["matches"] == []
 
 
 async def test_recognize_no_match_returns_empty_list(api, song_a, song_b):

@@ -7,11 +7,26 @@ import { toast } from "sonner";
 import PulseOrb, { type OrbState } from "./PulseOrb";
 import MatchCard, { ClipPlayer, listVariants } from "./MatchCard";
 import { AUDIO_EXT, DEFAULT_FILTERS, Dropzone, FilterPanel, type Filters } from "./Controls";
-import { API_URL, recognize } from "@/lib/api";
+import { recognize } from "@/lib/api";
 import type { RecognizeResponse } from "@/types";
 
 type Phase = "idle" | "recording" | "matching";
-const MAX_RECORD_MS = 15000;
+const LIVE_WINDOW_SECONDS = 10;
+const LIVE_HOP_SECONDS = 5;
+const PCM_SAMPLE_RATE = 16000;
+
+function pcmToWav(pcm: Int16Array): Blob {
+  const buffer = new ArrayBuffer(44 + pcm.byteLength);
+  const view = new DataView(buffer);
+  const write = (at: number, text: string) => [...text].forEach((char, i) => view.setUint8(at + i, char.charCodeAt(0)));
+  write(0, "RIFF"); view.setUint32(4, 36 + pcm.byteLength, true); write(8, "WAVEfmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, PCM_SAMPLE_RATE, true); view.setUint32(28, PCM_SAMPLE_RATE * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  write(36, "data"); view.setUint32(40, pcm.byteLength, true);
+  new Int16Array(buffer, 44).set(pcm);
+  return new Blob([buffer], { type: "audio/wav" });
+}
 
 export default function Recognizer() {
   const [phase, setPhase] = useState<Phase>("idle");
@@ -20,9 +35,16 @@ export default function Recognizer() {
   const [f, setF] = useState<Filters>(DEFAULT_FILTERS);
   const levelRef = useRef(0);
   const stopRec = useRef<(() => void) | null>(null);
-  const streamSocket = useRef<WebSocket | null>(null);
+  const liveTimer = useRef<number | null>(null);
+  const liveAbort = useRef<AbortController | null>(null);
+  const liveActive = useRef(false);
 
-  useEffect(() => () => { stopRec.current?.(); streamSocket.current?.close(); }, []);
+  useEffect(() => () => {
+    liveActive.current = false;
+    if (liveTimer.current !== null) window.clearInterval(liveTimer.current);
+    liveAbort.current?.abort();
+    stopRec.current?.();
+  }, []);
 
   const identify = useCallback(
     async (blob: Blob) => {
@@ -47,6 +69,7 @@ export default function Recognizer() {
   );
 
   const submit = (blob: Blob, label: string) => {
+    stopRec.current?.();
     setClip((prev) => {
       if (prev) URL.revokeObjectURL(prev.url);
       return { blob, label, url: URL.createObjectURL(blob) };
@@ -65,7 +88,8 @@ export default function Recognizer() {
       const ac = new AudioContext();
       const analyser = ac.createAnalyser();
       analyser.fftSize = 256;
-      ac.createMediaStreamSource(stream).connect(analyser);
+      const analyserSource = ac.createMediaStreamSource(stream);
+      analyserSource.connect(analyser);
       const data = new Uint8Array(analyser.frequencyBinCount);
       let raf = 0;
       const tick = () => {
@@ -75,36 +99,13 @@ export default function Recognizer() {
       };
       tick();
 
-      const socketUrl = API_URL.replace(/^http/, "ws") + "/api/v1/stream";
-      const socket = new WebSocket(socketUrl);
-      streamSocket.current = socket;
-      let socketReady = false;
-      let streamFailed = false;
-      let stopped = false;
-      socket.onopen = () => {
-        socketReady = true;
-        socket.send(JSON.stringify({
-          type: "start", limit: f.limit, score_threshold: f.threshold,
-          max_ai_generated_score: f.maxAi < 1 ? f.maxAi : null, vibe_tags: f.tags,
-        }));
-      };
-      socket.onmessage = (event: MessageEvent<string>) => {
-        const message = JSON.parse(event.data) as RecognizeResponse & { type: string; detail?: string };
-        if (message.type === "result") {
-          setResult({ matches: message.matches, query_windows: message.query_windows, query_duration_seconds: message.query_duration_seconds });
-        } else if (message.type === "error") {
-          streamFailed = true;
-          toast.error(message.detail ?? "Audio streaming failed.");
-        }
-      };
-      socket.onerror = () => { streamFailed = true; };
-      socket.onclose = () => {
-        if (!stopped) streamFailed = true;
-      };
       const source = ac.createMediaStreamSource(stream);
       const processor = ac.createScriptProcessor(4096, 1, 1);
-      const pcmChunks: Int16Array[] = [];
-      let pcmLength = 0;
+      let livePcm: Int16Array[] = [];
+      let liveSampleCount = 0;
+      let lastLiveSearch = 0;
+      let requestInFlight = false;
+      let stopped = false;
       source.connect(processor);
       processor.connect(ac.destination);
       processor.onaudioprocess = (event) => {
@@ -116,65 +117,70 @@ export default function Recognizer() {
           output[i] = Math.max(-1, Math.min(1, sample)) * 0x7fff;
         }
         if (!output.length) return;
-        pcmChunks.push(output);
-        pcmLength += output.length;
-        if (socketReady && socket.readyState === WebSocket.OPEN) socket.send(output.buffer);
+        livePcm.push(output);
+        liveSampleCount += output.length;
+        const maxLiveSamples = PCM_SAMPLE_RATE * LIVE_WINDOW_SECONDS;
+        while (liveSampleCount > maxLiveSamples && livePcm.length) {
+          const excess = liveSampleCount - maxLiveSamples;
+          const first = livePcm[0];
+          if (first.length <= excess) {
+            livePcm.shift();
+            liveSampleCount -= first.length;
+          } else {
+            livePcm[0] = first.slice(excess);
+            liveSampleCount -= excess;
+          }
+        }
       };
-      mr.onstop = async () => {
+      const stop = () => {
+        if (stopped) return;
         stopped = true;
+        liveActive.current = false;
+        if (liveTimer.current !== null) window.clearInterval(liveTimer.current);
+        liveTimer.current = null;
+        liveAbort.current?.abort();
+        liveAbort.current = null;
         cancelAnimationFrame(raf);
         levelRef.current = 0;
         processor.disconnect();
         source.disconnect();
+        analyserSource.disconnect();
         stream.getTracks().forEach((t) => t.stop());
-        ac.close();
-        if (socket.readyState === WebSocket.OPEN) socket.send("stop");
-        socket.close();
-        streamSocket.current = null;
-        try {
-          const pcm = new Int16Array(pcmLength);
-          let offset = 0;
-          pcmChunks.forEach((part) => { pcm.set(part, offset); offset += part.length; });
-          const wavBuffer = new ArrayBuffer(44 + pcm.byteLength);
-          const view = new DataView(wavBuffer);
-          const write = (at: number, text: string) => [...text].forEach((char, i) => view.setUint8(at + i, char.charCodeAt(0)));
-          write(0, "RIFF"); view.setUint32(4, 36 + pcm.byteLength, true); write(8, "WAVEfmt ");
-          view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
-          view.setUint32(24, 16000, true); view.setUint32(28, 32000, true);
-          view.setUint16(32, 2, true); view.setUint16(34, 16, true);
-          write(36, "data"); view.setUint32(40, pcm.byteLength, true);
-          new Int16Array(wavBuffer, 44).set(pcm);
-          const recording = new Blob([wavBuffer], { type: "audio/wav" });
-          setClip((prev) => {
-            if (prev) URL.revokeObjectURL(prev.url);
-            return { blob: recording, label: "Microphone clip", url: URL.createObjectURL(recording) };
-          });
-          if (streamFailed || !socketReady) identify(recording);
-          else setPhase("idle");
-        } catch {
-          setPhase("idle");
-          toast.error("Couldn't read the recording. Try again, or upload a file.");
-        }
+        void ac.close();
+        stopRec.current = null;
+        setPhase("idle");
       };
-      const stop = () => mr.state !== "inactive" && mr.stop();
       stopRec.current = stop;
-      mr.start();
       setResult(null);
       setPhase("recording");
-      const sendPcm = () => {
-        if (stopped) return;
-        if (socketReady && socket.readyState === WebSocket.OPEN && pcmChunks.length) {
-          const pending = pcmChunks.splice(0);
-          const length = pending.reduce((total, part) => total + part.length, 0);
-          const batch = new Int16Array(length);
-          let position = 0;
-          pending.forEach((part) => { batch.set(part, position); position += part.length; });
-          socket.send(batch.buffer);
-        }
-        if (!stopped) window.setTimeout(sendPcm, 250);
-      };
-      sendPcm();
-      setTimeout(stop, MAX_RECORD_MS);
+      liveActive.current = true;
+      liveTimer.current = window.setInterval(() => {
+        const requiredSamples = PCM_SAMPLE_RATE * LIVE_WINDOW_SECONDS;
+        if (!liveActive.current || requestInFlight || liveSampleCount < requiredSamples) return;
+        const now = Date.now();
+        if (now - lastLiveSearch < LIVE_HOP_SECONDS * 1000) return;
+        lastLiveSearch = now;
+        requestInFlight = true;
+        const pcm = new Int16Array(liveSampleCount);
+        let offset = 0;
+        livePcm.forEach((part) => { pcm.set(part, offset); offset += part.length; });
+        const controller = new AbortController();
+        liveAbort.current?.abort();
+        liveAbort.current = controller;
+        void recognize(pcmToWav(pcm), {
+          limit: f.limit, scoreThreshold: f.threshold,
+          maxAiScore: f.maxAi < 1 ? f.maxAi : undefined, vibeTags: f.tags,
+        }, controller.signal).then((res) => {
+          if (liveActive.current) setResult(res);
+        }).catch((error: unknown) => {
+          if (liveActive.current && !(error instanceof DOMException && error.name === "AbortError")) {
+            toast.error(error instanceof Error ? error.message : "Live recognition failed.");
+          }
+        }).finally(() => {
+          requestInFlight = false;
+          if (liveAbort.current === controller) liveAbort.current = null;
+        });
+      }, 500);
     } catch {
       toast.error("Microphone access is blocked. Allow it in your browser, or upload a file.");
     }
@@ -191,11 +197,11 @@ export default function Recognizer() {
           {phase === "recording" ? "Listening" : busy ? "Matching your clip" : "What's playing?"}
         </h1>
         <p className="mt-3 max-w-md text-slate-400">
-          Record a few seconds or drop an audio file. Sonar Pulse finds the track and where in it your clip starts.
+          Listen to nearby music for automatic live matches, or drop an audio file. Sonar Pulse finds the track and where your clip starts.
         </p>
         <div className="mt-6 flex gap-3">
           {phase === "recording" ? (
-            <button className="btn-primary" onClick={() => stopRec.current?.()}><Square className="h-4 w-4" /> Stop and identify</button>
+            <button className="btn-primary" onClick={() => stopRec.current?.()}><Square className="h-4 w-4" /> Stop listening</button>
           ) : (
             <button className="btn-primary" disabled={busy} onClick={startRecording}><Mic className="h-4 w-4" /> Listen</button>
           )}
