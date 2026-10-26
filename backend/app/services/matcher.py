@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 import statistics
 from collections import defaultdict
 from pathlib import Path
@@ -238,6 +239,29 @@ class AudioMatcher:
             "windows_indexed": len(points),
             "duration_seconds": waveform.numel() / TARGET_SAMPLE_RATE,
         }
+
+    async def update_track_metadata(self, track_id: str, metadata: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Validate and update editable metadata across a track's indexed windows."""
+        current = await self.qdrant.get_track(track_id)
+        if current is None:
+            return None
+        merged = {**current, **metadata, "track_id": track_id}
+        clean = _validate_metadata(merged)
+        editable = {key: clean[key] for key in ("title", "artist", "vibe_tags", "ai_generated_score")}
+        if not await self.qdrant.update_track_metadata(track_id, editable):
+            raise MatcherError(f"Qdrant did not acknowledge metadata update for '{track_id}'.")
+        return {**current, **editable}
+
+    async def update_track_metadata(self, track_id: str, metadata: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Validate and update editable metadata across a track's indexed windows."""
+        current = await self.qdrant.get_track(track_id)
+        if current is None:
+            return None
+        clean = _validate_metadata({**current, **metadata, "track_id": track_id})
+        editable = {key: clean[key] for key in ("title", "artist", "vibe_tags", "ai_generated_score")}
+        if not await self.qdrant.update_track_metadata(track_id, editable):
+            raise MatcherError(f"Qdrant did not acknowledge metadata update for '{track_id}'.")
+        return {**current, **editable}
 
     async def recognize_audio(
         self,

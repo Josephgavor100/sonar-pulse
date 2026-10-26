@@ -7,8 +7,7 @@ import { toast } from "sonner";
 import PulseOrb, { type OrbState } from "./PulseOrb";
 import MatchCard, { ClipPlayer, listVariants } from "./MatchCard";
 import { AUDIO_EXT, DEFAULT_FILTERS, Dropzone, FilterPanel, type Filters } from "./Controls";
-import { recognize } from "@/lib/api";
-import { toWav16k } from "@/lib/wav";
+import { API_URL, recognize } from "@/lib/api";
 import type { RecognizeResponse } from "@/types";
 
 type Phase = "idle" | "recording" | "matching";
@@ -21,8 +20,9 @@ export default function Recognizer() {
   const [f, setF] = useState<Filters>(DEFAULT_FILTERS);
   const levelRef = useRef(0);
   const stopRec = useRef<(() => void) | null>(null);
+  const streamSocket = useRef<WebSocket | null>(null);
 
-  useEffect(() => () => { stopRec.current?.(); }, []);
+  useEffect(() => () => { stopRec.current?.(); streamSocket.current?.close(); }, []);
 
   const identify = useCallback(
     async (blob: Blob) => {
@@ -75,16 +75,82 @@ export default function Recognizer() {
       };
       tick();
 
-      const mr = new MediaRecorder(stream);
-      const chunks: Blob[] = [];
-      mr.ondataavailable = (e) => chunks.push(e.data);
+      const socketUrl = API_URL.replace(/^http/, "ws") + "/api/v1/stream";
+      const socket = new WebSocket(socketUrl);
+      streamSocket.current = socket;
+      let socketReady = false;
+      let streamFailed = false;
+      let stopped = false;
+      socket.onopen = () => {
+        socketReady = true;
+        socket.send(JSON.stringify({
+          type: "start", limit: f.limit, score_threshold: f.threshold,
+          max_ai_generated_score: f.maxAi < 1 ? f.maxAi : null, vibe_tags: f.tags,
+        }));
+      };
+      socket.onmessage = (event: MessageEvent<string>) => {
+        const message = JSON.parse(event.data) as RecognizeResponse & { type: string; detail?: string };
+        if (message.type === "result") {
+          setResult({ matches: message.matches, query_windows: message.query_windows, query_duration_seconds: message.query_duration_seconds });
+        } else if (message.type === "error") {
+          streamFailed = true;
+          toast.error(message.detail ?? "Audio streaming failed.");
+        }
+      };
+      socket.onerror = () => { streamFailed = true; };
+      socket.onclose = () => {
+        if (!stopped) streamFailed = true;
+      };
+      const source = ac.createMediaStreamSource(stream);
+      const processor = ac.createScriptProcessor(4096, 1, 1);
+      const pcmChunks: Int16Array[] = [];
+      let pcmLength = 0;
+      source.connect(processor);
+      processor.connect(ac.destination);
+      processor.onaudioprocess = (event) => {
+        const input = event.inputBuffer.getChannelData(0);
+        const ratio = ac.sampleRate / 16000;
+        const output = new Int16Array(Math.floor(input.length / ratio));
+        for (let i = 0; i < output.length; i++) {
+          const sample = input[Math.floor(i * ratio)] ?? 0;
+          output[i] = Math.max(-1, Math.min(1, sample)) * 0x7fff;
+        }
+        if (!output.length) return;
+        pcmChunks.push(output);
+        pcmLength += output.length;
+        if (socketReady && socket.readyState === WebSocket.OPEN) socket.send(output.buffer);
+      };
       mr.onstop = async () => {
+        stopped = true;
         cancelAnimationFrame(raf);
         levelRef.current = 0;
+        processor.disconnect();
+        source.disconnect();
         stream.getTracks().forEach((t) => t.stop());
         ac.close();
+        if (socket.readyState === WebSocket.OPEN) socket.send("stop");
+        socket.close();
+        streamSocket.current = null;
         try {
-          submit(await toWav16k(new Blob(chunks, { type: mr.mimeType })), "Microphone clip");
+          const pcm = new Int16Array(pcmLength);
+          let offset = 0;
+          pcmChunks.forEach((part) => { pcm.set(part, offset); offset += part.length; });
+          const wavBuffer = new ArrayBuffer(44 + pcm.byteLength);
+          const view = new DataView(wavBuffer);
+          const write = (at: number, text: string) => [...text].forEach((char, i) => view.setUint8(at + i, char.charCodeAt(0)));
+          write(0, "RIFF"); view.setUint32(4, 36 + pcm.byteLength, true); write(8, "WAVEfmt ");
+          view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+          view.setUint32(24, 16000, true); view.setUint32(28, 32000, true);
+          view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+          write(36, "data"); view.setUint32(40, pcm.byteLength, true);
+          new Int16Array(wavBuffer, 44).set(pcm);
+          const recording = new Blob([wavBuffer], { type: "audio/wav" });
+          setClip((prev) => {
+            if (prev) URL.revokeObjectURL(prev.url);
+            return { blob: recording, label: "Microphone clip", url: URL.createObjectURL(recording) };
+          });
+          if (streamFailed || !socketReady) identify(recording);
+          else setPhase("idle");
         } catch {
           setPhase("idle");
           toast.error("Couldn't read the recording. Try again, or upload a file.");
@@ -93,7 +159,21 @@ export default function Recognizer() {
       const stop = () => mr.state !== "inactive" && mr.stop();
       stopRec.current = stop;
       mr.start();
+      setResult(null);
       setPhase("recording");
+      const sendPcm = () => {
+        if (stopped) return;
+        if (socketReady && socket.readyState === WebSocket.OPEN && pcmChunks.length) {
+          const pending = pcmChunks.splice(0);
+          const length = pending.reduce((total, part) => total + part.length, 0);
+          const batch = new Int16Array(length);
+          let position = 0;
+          pending.forEach((part) => { batch.set(part, position); position += part.length; });
+          socket.send(batch.buffer);
+        }
+        if (!stopped) window.setTimeout(sendPcm, 250);
+      };
+      sendPcm();
       setTimeout(stop, MAX_RECORD_MS);
     } catch {
       toast.error("Microphone access is blocked. Allow it in your browser, or upload a file.");
