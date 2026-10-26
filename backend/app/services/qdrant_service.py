@@ -211,6 +211,56 @@ class QdrantService:
             for hit in response.points
         ]
 
+    # --------------------------------------------------------------- library
+    async def list_tracks(self) -> list[dict[str, Any]]:
+        """Return one metadata record per indexed track."""
+        try:
+            points, offset = await self.client.scroll(
+                collection_name=self.collection_name,
+                limit=256,
+                with_payload=True,
+                with_vectors=False,
+            )
+            records: dict[str, dict[str, Any]] = {}
+            while True:
+                for point in points:
+                    payload = dict(point.payload or {})
+                    track_id = payload.get("track_id")
+                    if track_id is not None:
+                        records.setdefault(str(track_id), payload)
+                if offset is None:
+                    break
+                points, offset = await self.client.scroll(
+                    collection_name=self.collection_name,
+                    limit=256,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            return sorted(records.values(), key=lambda item: (str(item.get("artist", "")).casefold(), str(item.get("title", "")).casefold()))
+        except Exception as exc:
+            raise QdrantServiceError(f"Library listing failed: {exc}") from exc
+
+    async def update_track_metadata(self, track_id: str, metadata: dict[str, Any]) -> bool:
+        """Update metadata on every embedding window for a track."""
+        try:
+            result = await self.client.set_payload(
+                collection_name=self.collection_name,
+                payload=metadata,
+                points=models.FilterSelector(
+                    filter=models.Filter(must=[models.FieldCondition(key="track_id", match=models.MatchValue(value=track_id))])
+                ),
+                wait=True,
+            )
+            return result.status == models.UpdateStatus.COMPLETED
+        except Exception as exc:
+            raise QdrantServiceError(f"Metadata update failed: {exc}") from exc
+
+    async def get_track(self, track_id: str) -> dict[str, Any] | None:
+        """Return metadata for one track, or None when it is not indexed."""
+        tracks = await self.list_tracks()
+        return next((track for track in tracks if track.get("track_id") == track_id), None)
+
     # ----------------------------------------------------------------- delete
     async def delete_points_by_track_id(self, track_id: str) -> bool:
         """Delete every window belonging to ``track_id``.
